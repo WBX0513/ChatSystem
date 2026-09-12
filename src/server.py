@@ -22,6 +22,7 @@ log_queue = queue.Queue()  # 用于线程安全的日志输出
 message_queue = queue.Queue()  # 用于消息显示
 chat_records = []          # 全局聊天记录存储
 log_records = []           # 全局日志记录存储
+refresh_event = threading.Event()  # 有列表变化时通知GUI立即刷新
 
 
 class ServerGUI:
@@ -37,6 +38,7 @@ class ServerGUI:
         self.update_ban_list()
         self.update_ipban_list()
         self.update_admin_list()
+        self.check_refresh_event()   # 启动事件触发的即时刷新检查
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
@@ -141,6 +143,8 @@ class ServerGUI:
                   command=self.ban_selected_ip).pack(side=tk.LEFT, padx=2)
         tk.Button(online_btn_frame, text="设为管理员", bg='#9b59b6', fg='white',
                   command=self.set_selected_admin).pack(side=tk.LEFT, padx=2)
+        tk.Button(online_btn_frame, text="刷新", bg='#3498db', fg='white',
+                  command=self.refresh_user_list).pack(side=tk.RIGHT, padx=2)
 
         # ========== 黑名单列表 ==========
         ban_frame = tk.LabelFrame(right_panel, text="用户黑名单", font=('Arial', 11, 'bold'),
@@ -155,8 +159,14 @@ class ServerGUI:
         ban_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.ban_listbox.config(yscrollcommand=ban_scrollbar.set)
         ban_scrollbar.config(command=self.ban_listbox.yview)
-        tk.Button(ban_frame, text="解除拉黑", bg='#27ae60', fg='white',
-                  command=self.unban_selected_user).pack(fill=tk.X, pady=5)
+
+        # 黑名单操作按钮
+        ban_btn_frame = tk.Frame(ban_frame, bg='#f0f0f0')
+        ban_btn_frame.pack(fill=tk.X, pady=5)
+        tk.Button(ban_btn_frame, text="解除拉黑", bg='#27ae60', fg='white',
+                  command=self.unban_selected_user).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        tk.Button(ban_btn_frame, text="刷新", bg='#3498db', fg='white',
+                  command=self.refresh_ban_list).pack(side=tk.RIGHT)
 
         # ========== IP封禁列表 ==========
         ipban_frame = tk.LabelFrame(right_panel, text="IP封禁列表", font=('Arial', 11, 'bold'),
@@ -172,9 +182,13 @@ class ServerGUI:
         self.ipban_listbox.config(yscrollcommand=ipban_scrollbar.set)
         ipban_scrollbar.config(command=self.ipban_listbox.yview)
 
-        # 解除IP封禁按钮
-        tk.Button(ipban_frame, text="解除IP封禁", bg='#27ae60', fg='white',
-                  command=self.unban_selected_ip).pack(fill=tk.X, pady=5)
+        # 解除IP封禁按钮 + 刷新
+        ipban_btn_frame = tk.Frame(ipban_frame, bg='#f0f0f0')
+        ipban_btn_frame.pack(fill=tk.X, pady=5)
+        tk.Button(ipban_btn_frame, text="解除IP封禁", bg='#27ae60', fg='white',
+                  command=self.unban_selected_ip).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        tk.Button(ipban_btn_frame, text="刷新", bg='#3498db', fg='white',
+                  command=self.refresh_ipban_list).pack(side=tk.RIGHT)
 
         # 手动封禁IP输入区域
         manual_ip_frame = tk.Frame(ipban_frame, bg='#f0f0f0')
@@ -255,31 +269,60 @@ class ServerGUI:
     def clear_message_area(self):
         self.message_area.delete("1.0", tk.END)
 
-    def update_user_list(self):
+    # ========== 事件触发的即时刷新 ==========
+    def check_refresh_event(self):
+        """每 200 毫秒检查一次刷新信号，有变化则立即刷新相关列表"""
+        if refresh_event.is_set():
+            refresh_event.clear()
+            self.refresh_user_list()
+            self.refresh_ban_list()
+            self.refresh_ipban_list()
+        self.root.after(200, self.check_refresh_event)
+
+    # ========== 在线用户列表：刷新与定时 ==========
+    def refresh_user_list(self):
+        """真正执行刷新在线用户列表（可手动/定时/事件触发调用）"""
         with lock:
             current_users = list(clients.keys())
         self.user_listbox.delete(0, tk.END)
         for user in sorted(current_users):
             self.user_listbox.insert(tk.END, user)
         self.status_label.config(text=f"服务器运行中... 在线用户: {len(current_users)}")
-        self.root.after(2000, self.update_user_list)
 
-    def update_ban_list(self):
+    def update_user_list(self):
+        """定时调度：每 10 秒刷新一次"""
+        self.refresh_user_list()
+        self.root.after(10000, self.update_user_list)
+
+    # ========== 用户黑名单：刷新与定时 ==========
+    def refresh_ban_list(self):
+        """真正执行刷新用户黑名单（可手动/定时/事件触发调用）"""
         with lock:
             current_bans = list(banned_users)
         self.ban_listbox.delete(0, tk.END)
         for user in sorted(current_bans):
             self.ban_listbox.insert(tk.END, user)
-        self.root.after(2000, self.update_ban_list)
 
-    def update_ipban_list(self):
+    def update_ban_list(self):
+        """定时调度：每 10 秒刷新一次"""
+        self.refresh_ban_list()
+        self.root.after(10000, self.update_ban_list)
+
+    # ========== IP封禁列表：刷新与定时 ==========
+    def refresh_ipban_list(self):
+        """真正执行刷新IP封禁列表（可手动/定时/事件触发调用）"""
         with lock:
             current_ipbans = list(banned_ips)
         self.ipban_listbox.delete(0, tk.END)
         for ip in sorted(current_ipbans):
             self.ipban_listbox.insert(tk.END, ip)
-        self.root.after(2000, self.update_ipban_list)
 
+    def update_ipban_list(self):
+        """定时调度：每 10 秒刷新一次"""
+        self.refresh_ipban_list()
+        self.root.after(10000, self.update_ipban_list)
+
+    # ========== 管理员列表（保持原逻辑，2 秒刷新） ==========
     def update_admin_list(self):
         with lock:
             current_admins = list(admins)
@@ -546,6 +589,7 @@ def kick_user(target_username):
         del clients[target_username]
     broadcast_message("系统", f"{target_username} 已被管理员踢出！当前在线人数：{len(clients)}")
     log_queue.put(f"[{get_current_time()}] 已踢出用户 {target_username}")
+    refresh_event.set()   # 触发GUI立即刷新
     return True
 
 
@@ -576,6 +620,7 @@ def ban_user(target_username):
         log_queue.put(f"[{get_current_time()}] 用户 {target_username} 已被拉黑并踢出")
     else:
         log_queue.put(f"[{get_current_time()}] 用户 {target_username} 已被拉黑（不在线）")
+    refresh_event.set()   # 触发GUI立即刷新
 
 
 def unban_user(target_username):
@@ -586,6 +631,7 @@ def unban_user(target_username):
             log_queue.put(f"[{get_current_time()}] 用户 {target_username} 已被解除拉黑")
         else:
             log_queue.put(f"[{get_current_time()}] 用户 {target_username} 不在黑名单中")
+    refresh_event.set()   # 触发GUI立即刷新
 
 
 def ban_ip(ip_address):
@@ -618,6 +664,7 @@ def ban_ip(ip_address):
         log_queue.put(f"[{get_current_time()}] IP {ip_address} 已被封禁，并踢出所有在线用户")
     else:
         log_queue.put(f"[{get_current_time()}] IP {ip_address} 已被封禁（无在线用户）")
+    refresh_event.set()   # 触发GUI立即刷新
 
 
 def unban_ip(ip_address):
@@ -628,6 +675,7 @@ def unban_ip(ip_address):
             log_queue.put(f"[{get_current_time()}] IP {ip_address} 已被解除封禁")
         else:
             log_queue.put(f"[{get_current_time()}] IP {ip_address} 不在封禁列表中")
+    refresh_event.set()   # 触发GUI立即刷新
 
 
 def set_admin(username):
@@ -741,6 +789,7 @@ def handle_client(client_socket, addr):
 
         broadcast_message("系统", f"{username} 已上线！当前在线人数：{len(clients)}")
         log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已连接，当前在线：{len(clients)}")
+        refresh_event.set()   # 有用户加入，立即刷新在线用户列表
 
         while server_running:
             try:
@@ -800,6 +849,7 @@ def handle_client(client_socket, addr):
                 del clients[username]
             broadcast_message("系统", f"{username} 已下线！当前在线人数：{len(clients)}")
             log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已断开，当前在线：{len(clients)}")
+            refresh_event.set()   # 有用户离开，立即刷新在线用户列表
         client_socket.close()
 
 
