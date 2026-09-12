@@ -4,9 +4,10 @@ import json
 import time
 from datetime import datetime
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
+from tkinter import scrolledtext, messagebox, ttk, filedialog
 from tkinter import font as tkfont
 import queue
+import os
 
 # 服务器配置
 HOST = '0.0.0.0'
@@ -18,12 +19,14 @@ lock = threading.Lock()    # 保护 clients, banned_users, banned_ips
 server_running = True
 server_socket = None
 log_queue = queue.Queue()  # 用于线程安全的日志输出
+chat_records = []          # 全局聊天记录存储
+log_records = []           # 全局日志记录存储
 
 class ServerGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("聊天服务器管理控制台")
-        self.root.geometry("900x700")
+        self.root.geometry("1000x750")
         
         # 设置样式
         self.root.configure(bg='#f0f0f0')
@@ -43,6 +46,9 @@ class ServerGUI:
         # 启动IP封禁列表更新循环
         self.update_ipban_list()
         
+        # 启动消息监测列表更新
+        self.update_monitor_list()
+        
         # 处理窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -55,11 +61,20 @@ class ServerGUI:
                                bg='#2c3e50', fg='white')
         title_label.pack(pady=10)
         
+        # 公告发送区域
+        notice_frame = tk.Frame(self.root, bg='#f0f0f0')
+        notice_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(notice_frame, text="服务器公告：", bg='#f0f0f0', font=('Arial', 11)).pack(side=tk.LEFT, padx=5)
+        self.notice_entry = tk.Entry(notice_frame, font=('Arial', 11), width=60)
+        self.notice_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        tk.Button(notice_frame, text="发送公告", bg='#3498db', fg='white', 
+                  command=self.send_notice).pack(side=tk.LEFT, padx=5)
+        
         # 主内容区域（左右分栏）
         main_panel = tk.Frame(self.root, bg='#f0f0f0')
         main_panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # 左侧面板（日志显示）
+        # 左侧面板（日志+消息监测）
         left_panel = tk.Frame(main_panel, bg='#f0f0f0')
         left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
@@ -67,14 +82,43 @@ class ServerGUI:
         log_frame = tk.LabelFrame(left_panel, text="服务器日志", 
                                   font=('Arial', 11, 'bold'),
                                   bg='#f0f0f0', padx=5, pady=5)
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # 日志操作按钮
+        log_btn_frame = tk.Frame(log_frame, bg='#f0f0f0')
+        log_btn_frame.pack(fill=tk.X, pady=5)
+        tk.Button(log_btn_frame, text="保存日志", bg='#27ae60', fg='white', 
+                  command=self.save_log).pack(side=tk.LEFT, padx=2)
+        tk.Button(log_btn_frame, text="清空日志", bg='#e74c3c', fg='white', 
+                  command=self.clear_log).pack(side=tk.LEFT, padx=2)
         
         self.log_area = scrolledtext.ScrolledText(log_frame, 
                                                    wrap=tk.WORD,
                                                    font=('Consolas', 10),
                                                    bg='white',
-                                                   height=20)
+                                                   height=15)
         self.log_area.pack(fill=tk.BOTH, expand=True)
+        
+        # 消息监测区域
+        monitor_frame = tk.LabelFrame(left_panel, text="消息监测", 
+                                      font=('Arial', 11, 'bold'),
+                                      bg='#f0f0f0', padx=5, pady=5)
+        monitor_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 聊天记录操作按钮
+        chat_btn_frame = tk.Frame(monitor_frame, bg='#f0f0f0')
+        chat_btn_frame.pack(fill=tk.X, pady=5)
+        tk.Button(chat_btn_frame, text="保存聊天记录", bg='#27ae60', fg='white', 
+                  command=self.save_chat_records).pack(side=tk.LEFT, padx=2)
+        tk.Button(chat_btn_frame, text="清空聊天记录", bg='#e74c3c', fg='white', 
+                  command=self.clear_chat_records).pack(side=tk.LEFT, padx=2)
+        
+        self.monitor_area = scrolledtext.ScrolledText(monitor_frame, 
+                                                      wrap=tk.WORD,
+                                                      font=('Consolas', 10),
+                                                      bg='white',
+                                                      height=10)
+        self.monitor_area.pack(fill=tk.BOTH, expand=True)
         
         # 右侧面板（管理区域）
         right_panel = tk.Frame(main_panel, bg='#f0f0f0', width=300)
@@ -200,8 +244,9 @@ class ServerGUI:
         self.status_label.pack(side=tk.LEFT)
     
     def log(self, message):
-        """添加日志到队列"""
+        """添加日志到队列和全局日志记录"""
         log_queue.put(message)
+        log_records.append(message)
     
     def update_log(self):
         """更新日志显示"""
@@ -248,6 +293,16 @@ class ServerGUI:
             self.ipban_listbox.insert(tk.END, ip)
         
         self.root.after(2000, self.update_ipban_list)
+    
+    def update_monitor_list(self):
+        """更新消息监测列表"""
+        self.monitor_area.config(state=tk.NORMAL)
+        self.monitor_area.delete(1.0, tk.END)
+        for record in chat_records:
+            self.monitor_area.insert(tk.END, record + '\n')
+        self.monitor_area.config(state=tk.DISABLED)
+        self.monitor_area.see(tk.END)
+        self.root.after(1000, self.update_monitor_list)
     
     def get_selected_user(self, listbox):
         """获取选中的用户名"""
@@ -302,6 +357,82 @@ class ServerGUI:
         else:
             messagebox.showwarning("提示", "请输入要封禁的IP地址")
     
+    def send_notice(self):
+        """发送服务器公告"""
+        notice_content = self.notice_entry.get().strip()
+        if not notice_content:
+            messagebox.showwarning("提示", "公告内容不能为空！")
+            return
+        with lock:
+            notice_data = {
+                "type": "notice",
+                "content": notice_content,
+                "time": get_current_time()
+            }
+            notice_json = json.dumps(notice_data, ensure_ascii=False)
+            # 广播公告给所有在线用户
+            for username, (client_socket, addr) in list(clients.items()):
+                try:
+                    client_socket.send(notice_json.encode('utf-8'))
+                except:
+                    self.log(f"[{get_current_time()}] 向 {username} 发送公告失败")
+        self.log(f"[{get_current_time()}] 发送公告：{notice_content}")
+        self.notice_entry.delete(0, tk.END)
+    
+    def save_log(self):
+        """保存服务器日志到文件"""
+        if not log_records:
+            messagebox.showinfo("提示", "日志为空，无需保存")
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            title="保存服务器日志"
+        )
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(log_records))
+                messagebox.showinfo("成功", f"日志已保存到：{file_path}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存日志失败：{e}")
+    
+    def clear_log(self):
+        """清空服务器日志"""
+        if messagebox.askyesno("确认", "确定要清空服务器日志吗？"):
+            global log_records
+            log_records = []
+            self.log_area.delete(1.0, tk.END)
+            self.log(f"[{get_current_time()}] 服务器日志已清空")
+    
+    def save_chat_records(self):
+        """保存聊天记录到文件"""
+        if not chat_records:
+            messagebox.showinfo("提示", "聊天记录为空，无需保存")
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            title="保存聊天记录"
+        )
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(chat_records))
+                messagebox.showinfo("成功", f"聊天记录已保存到：{file_path}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存聊天记录失败：{e}")
+    
+    def clear_chat_records(self):
+        """清空聊天记录"""
+        if messagebox.askyesno("确认", "确定要清空聊天记录吗？"):
+            global chat_records
+            chat_records = []
+            self.monitor_area.config(state=tk.NORMAL)
+            self.monitor_area.delete(1.0, tk.END)
+            self.monitor_area.config(state=tk.DISABLED)
+            self.log(f"[{get_current_time()}] 聊天记录已清空")
+    
     def on_closing(self):
         """窗口关闭事件"""
         if messagebox.askyesno("确认", "确定要关闭服务器吗？"):
@@ -317,7 +448,7 @@ def get_current_time():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def broadcast_message(sender, message):
-    """广播消息给所有在线用户（除发送者外）"""
+    """广播消息给所有在线用户（除发送者外），并记录聊天记录"""
     with lock:
         msg_data = {
             "type": "message",
@@ -326,6 +457,10 @@ def broadcast_message(sender, message):
             "time": get_current_time()
         }
         msg_json = json.dumps(msg_data, ensure_ascii=False)
+        # 记录聊天记录
+        chat_record = f"[{msg_data['time']}] {sender}：{message}"
+        chat_records.append(chat_record)
+        # 广播消息
         for username, (client_socket, addr) in list(clients.items()):
             if username != sender:
                 try:
@@ -481,11 +616,13 @@ def shutdown_server():
     log_queue.put(f"[{get_current_time()}] 服务器关闭程序已执行。")
 
 def handle_client(client_socket, addr):
+    """优化客户端消息处理，防止大量消息导致异常"""
     username = None
     last_msg_time = time.time()
     char_count = 0
     client_ip = addr[0]
-
+    msg_buffer = ""  # 消息缓冲区，处理粘包
+    
     # 首先检查IP是否被封禁
     with lock:
         if client_ip in banned_ips:
@@ -501,9 +638,22 @@ def handle_client(client_socket, addr):
             return
 
     try:
-        # 接收用户名
-        username_data = client_socket.recv(1024).decode('utf-8')
-        username = json.loads(username_data)["username"]
+        # 接收用户名（处理粘包）
+        while True:
+            try:
+                chunk = client_socket.recv(1024).decode('utf-8')
+                if not chunk:
+                    raise ConnectionResetError("客户端断开连接")
+                msg_buffer += chunk
+                # 尝试解析JSON
+                username_data = json.loads(msg_buffer)
+                msg_buffer = ""
+                break
+            except json.JSONDecodeError:
+                # 未接收完整，继续接收
+                continue
+        
+        username = username_data["username"]
 
         # 检查用户名黑名单
         with lock:
@@ -528,27 +678,56 @@ def handle_client(client_socket, addr):
         broadcast_message("系统", f"{username} 已上线！当前在线人数：{len(clients)}")
         log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已连接，当前在线：{len(clients)}")
 
+        # 限制消息接收速率，防止大量消息攻击
+        msg_count = 0
+        msg_time_window = time.time()
+        
         while server_running:
             try:
-                msg = client_socket.recv(1024).decode('utf-8')
-            except:
+                # 分段接收消息，处理粘包
+                chunk = client_socket.recv(4096).decode('utf-8')  # 增大接收缓冲区
+                if not chunk:
+                    break
+                msg_buffer += chunk
+                
+                # 按JSON边界分割消息（简单处理，实际可优化）
+                while msg_buffer:
+                    try:
+                        # 查找JSON结束符
+                        end_idx = msg_buffer.rfind('}') + 1
+                        if end_idx <= 0:
+                            break
+                        msg_str = msg_buffer[:end_idx]
+                        msg_buffer = msg_buffer[end_idx:]
+                        
+                        msg_data = json.loads(msg_str)
+                        if msg_data["type"] == "message":
+                            content = msg_data["content"]
+                            
+                            # 消息速率限制：10秒内最多接收20条消息
+                            now = time.time()
+                            if now - msg_time_window > 10:
+                                msg_count = 0
+                                msg_time_window = now
+                            msg_count += 1
+                            if msg_count > 20:
+                                # 超出速率限制，暂时断开
+                                limit_msg = json.dumps({
+                                    "type": "system",
+                                    "content": "消息发送速率过快，请稍后再试！",
+                                    "time": get_current_time()
+                                }, ensure_ascii=False)
+                                client_socket.send(limit_msg.encode('utf-8'))
+                                raise ConnectionResetError("消息速率超限")
+                            
+                            broadcast_message(username, content)
+                    except json.JSONDecodeError:
+                        # 未接收完整，继续缓冲
+                        continue
+                    
+            except Exception as e:
+                log_queue.put(f"[{get_current_time()}] 客户端 {username} 异常：{e}")
                 break
-            if not msg:
-                break
-
-            msg_data = json.loads(msg)
-            if msg_data["type"] == "message":
-                content = msg_data["content"]
-                now = time.time()
-
-                # 速率检查
-                if now - last_msg_time <= 1.0:
-                    char_count += 1
-                else:
-                    char_count += 1
-                    last_msg_time = now
-
-                broadcast_message(username, content)
 
     except Exception as e:
         log_queue.put(f"[{get_current_time()}] 处理客户端 {addr} 时出错：{e}")
@@ -574,6 +753,8 @@ def start_server():
             server_socket.settimeout(1.0)
             try:
                 client_socket, addr = server_socket.accept()
+                # 设置客户端套接字超时，防止阻塞
+                client_socket.settimeout(300)
                 client_thread = threading.Thread(target=handle_client, args=(client_socket, addr))
                 client_thread.daemon = True
                 client_thread.start()
