@@ -2,8 +2,9 @@ import socket
 import threading
 import json
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, filedialog
 from datetime import datetime
+import queue
 
 # 客户端配置
 SERVER_PORT = 9999  # 端口固定
@@ -12,18 +13,22 @@ class ChatClient:
     def __init__(self, root):
         self.root = root
         self.root.title("Python聊天系统")
-        self.root.geometry("500x650")
+        self.root.geometry("500x700")
         self.root.resizable(False, False)
         
         self.client_socket = None
         self.username = None
         self.server_host = None
         self.is_connected = False
+        self.msg_queue = queue.Queue()  # 消息队列，防止UI阻塞
         
         self.create_ui()
         
+        # 启动消息处理循环
+        self.process_msg_queue()
+    
     def create_ui(self):
-        """创建聊天界面（修复发送按钮显示问题）"""
+        """创建聊天界面（修复发送按钮显示问题，新增功能按钮）"""
         # 1. 服务器地址区域
         server_frame = tk.Frame(self.root)
         server_frame.pack(pady=10, padx=10, fill=tk.X)
@@ -42,6 +47,14 @@ class ChatClient:
         self.username_entry.grid(row=0, column=1, padx=5, sticky=tk.W)
         self.login_btn = tk.Button(login_frame, text="登录", command=self.login, width=8)
         self.login_btn.grid(row=0, column=2, padx=5, sticky=tk.W)
+        
+        # 聊天记录操作按钮区域
+        chat_op_frame = tk.Frame(self.root)
+        chat_op_frame.pack(pady=5, padx=10, fill=tk.X)
+        tk.Button(chat_op_frame, text="保存聊天记录", bg='#27ae60', fg='white', 
+                  command=self.save_chat_records, width=12).pack(side=tk.LEFT, padx=2)
+        tk.Button(chat_op_frame, text="清空聊天记录", bg='#e74c3c', fg='white', 
+                  command=self.clear_chat_records, width=12).pack(side=tk.LEFT, padx=2)
         
         # 3. 聊天显示区域（等宽字体）
         self.chat_display = scrolledtext.ScrolledText(
@@ -97,21 +110,63 @@ class ChatClient:
         return space_count
         
     def add_message(self, message):
-        """添加消息到显示区，保持对齐"""
-        self.chat_display.config(state=tk.NORMAL)
-        lines = message.split("\n")
-        if len(lines) > 1:
-            base_line = lines[0]
-            if "：" in base_line:
-                sender_header = base_line.split("：")[0] + "："
-                indent_spaces = self.calc_indent_spaces(sender_header)
-                indent = " " * indent_spaces
-                new_lines = [base_line] + [indent + line for line in lines[1:]]
-                message = "\n".join(new_lines)
-        self.chat_display.insert(tk.END, message + "\n")
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.see(tk.END)
-        
+        """线程安全添加消息到显示区，防止大量消息导致UI阻塞"""
+        self.msg_queue.put(message)
+    
+    def process_msg_queue(self):
+        """处理消息队列，更新UI（主线程执行）"""
+        try:
+            while True:
+                message = self.msg_queue.get_nowait()
+                self.chat_display.config(state=tk.NORMAL)
+                lines = message.split("\n")
+                if len(lines) > 1:
+                    base_line = lines[0]
+                    if "：" in base_line:
+                        sender_header = base_line.split("：")[0] + "："
+                        indent_spaces = self.calc_indent_spaces(sender_header)
+                        indent = " " * indent_spaces
+                        new_lines = [base_line] + [indent + line for line in lines[1:]]
+                        message = "\n".join(new_lines)
+                self.chat_display.insert(tk.END, message + "\n")
+                # 限制聊天记录长度，防止内存溢出（保留最新1000行）
+                line_count = int(self.chat_display.index('end-1c').split('.')[0])
+                if line_count > 1000:
+                    self.chat_display.delete(1.0, f"{line_count - 1000}.0")
+                self.chat_display.config(state=tk.DISABLED)
+                self.chat_display.see(tk.END)
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(50, self.process_msg_queue)  # 50ms检查一次队列
+    
+    def save_chat_records(self):
+        """保存聊天记录到文件"""
+        chat_content = self.chat_display.get(1.0, tk.END)
+        if not chat_content.strip():
+            messagebox.showinfo("提示", "聊天记录为空，无需保存")
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            title="保存聊天记录"
+        )
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(chat_content)
+                messagebox.showinfo("成功", f"聊天记录已保存到：{file_path}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存聊天记录失败：{e}")
+    
+    def clear_chat_records(self):
+        """清空聊天记录"""
+        if messagebox.askyesno("确认", "确定要清空聊天记录吗？"):
+            self.chat_display.config(state=tk.NORMAL)
+            self.chat_display.delete(1.0, tk.END)
+            self.chat_display.config(state=tk.DISABLED)
+            self.add_message(f"[{self.get_current_time()}] 聊天记录已清空")
+    
     def login(self):
         """登录逻辑"""
         self.server_host = self.server_entry.get().strip()
@@ -126,6 +181,8 @@ class ChatClient:
         
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # 设置套接字超时，防止连接阻塞
+            self.client_socket.settimeout(10)
             self.client_socket.connect((self.server_host, SERVER_PORT))
             
             login_data = json.dumps({"username": self.username}, ensure_ascii=False)
@@ -145,6 +202,7 @@ class ChatClient:
             self.add_message(f"[{self.get_current_time()}] 成功连接服务器：{self.server_host}")
             self.add_message(f"[{self.get_current_time()}] 登录成功，开始聊天吧！")
             
+            # 启动接收线程（守护线程）
             recv_thread = threading.Thread(target=self.receive_messages)
             recv_thread.daemon = True
             recv_thread.start()
@@ -153,17 +211,42 @@ class ChatClient:
             messagebox.showerror("错误", f"连接服务器失败：{e}")
     
     def receive_messages(self):
-        """接收消息逻辑"""
+        """优化接收消息逻辑，防止大量消息导致闪退"""
+        msg_buffer = ""  # 消息缓冲区，处理粘包
         while self.is_connected:
             try:
-                msg = self.client_socket.recv(1024).decode('utf-8')
-                if not msg:
+                # 增大接收缓冲区，分段接收
+                chunk = self.client_socket.recv(4096).decode('utf-8')
+                if not chunk:
                     break
+                msg_buffer += chunk
                 
-                msg_data = json.loads(msg)
-                if msg_data["type"] == "message":
-                    self.add_message(f"[{msg_data['time']}] {msg_data['sender']}：{msg_data['content']}")
-            except:
+                # 按JSON边界分割消息，处理粘包
+                while msg_buffer:
+                    try:
+                        # 查找JSON结束符
+                        end_idx = msg_buffer.rfind('}') + 1
+                        if end_idx <= 0:
+                            break
+                        msg_str = msg_buffer[:end_idx]
+                        msg_buffer = msg_buffer[end_idx:]
+                        
+                        msg_data = json.loads(msg_str)
+                        if msg_data["type"] == "message":
+                            self.add_message(f"[{msg_data['time']}] {msg_data['sender']}：{msg_data['content']}")
+                        elif msg_data["type"] == "system":
+                            self.add_message(f"[{msg_data['time']}] 系统提示：{msg_data['content']}")
+                        elif msg_data["type"] == "notice":
+                            self.add_message(f"[{msg_data['time']}] 服务器公告：{msg_data['content']}")
+                    except json.JSONDecodeError:
+                        # 未接收完整，继续缓冲
+                        continue
+                    
+            except socket.timeout:
+                continue
+            except Exception as e:
+                # 捕获异常，防止线程崩溃
+                self.add_message(f"[{self.get_current_time()}] 接收消息异常：{str(e)}")
                 break
         
         self.is_connected = False
@@ -191,7 +274,13 @@ class ChatClient:
                 "sender": self.username,
                 "time": self.get_current_time()
             }, ensure_ascii=False)
-            self.client_socket.send(msg_data.encode('utf-8'))
+            # 分段发送大消息
+            if len(msg_data.encode('utf-8')) > 1024:
+                for i in range(0, len(msg_data), 1024):
+                    chunk = msg_data[i:i+1024]
+                    self.client_socket.send(chunk.encode('utf-8'))
+            else:
+                self.client_socket.send(msg_data.encode('utf-8'))
             
             # 清空输入框
             self.msg_text.delete("1.0", tk.END)
