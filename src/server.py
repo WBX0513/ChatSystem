@@ -23,6 +23,8 @@ message_queue = queue.Queue()  # 用于消息显示
 chat_records = []          # 全局聊天记录存储
 log_records = []           # 全局日志记录存储
 refresh_event = threading.Event()  # 有列表变化时通知GUI立即刷新
+close_requested = threading.Event()  # 客户端请求关闭服务器时通知GUI弹窗
+admin_request_queue = queue.Queue()  # 管理员变更请求队列（需服务器GUI确认）
 
 
 class ServerGUI:
@@ -269,14 +271,42 @@ class ServerGUI:
     def clear_message_area(self):
         self.message_area.delete("1.0", tk.END)
 
-    # ========== 事件触发的即时刷新 ==========
+    # ========== 事件触发的即时刷新 + 关闭请求检查 + 管理员变更请求检查 ==========
     def check_refresh_event(self):
-        """每 200 毫秒检查一次刷新信号，有变化则立即刷新相关列表"""
+        """每 200 毫秒检查一次刷新信号、关闭请求和管理员变更请求"""
+        # 列表刷新信号
         if refresh_event.is_set():
             refresh_event.clear()
             self.refresh_user_list()
             self.refresh_ban_list()
             self.refresh_ipban_list()
+        # 客户端关闭服务器请求
+        if close_requested.is_set():
+            close_requested.clear()
+            # on_closing 内部会弹窗确认，确认后关闭服务器
+            self.on_closing()
+        # 管理员变更请求（需服务器GUI确认）
+        while True:
+            try:
+                action, target, requester = admin_request_queue.get_nowait()
+            except queue.Empty:
+                break
+            if action == "new":
+                if messagebox.askyesno("管理员变更确认",
+                                       f"管理员 {requester} 请求将用户 {target} 设为管理员。\n\n是否同意？"):
+                    set_admin(target)
+                    log_queue.put(f"[{get_current_time()}] 服务器已同意 {requester} 的请求：将 {target} 设为管理员")
+                else:
+                    send_system_message(requester, f"服务器已拒绝将 {target} 设为管理员的请求")
+                    log_queue.put(f"[{get_current_time()}] 服务器已拒绝 {requester} 的请求：将 {target} 设为管理员")
+            elif action == "cancel":
+                if messagebox.askyesno("管理员变更确认",
+                                       f"管理员 {requester} 请求取消用户 {target} 的管理员权限。\n\n是否同意？"):
+                    remove_admin(target)
+                    log_queue.put(f"[{get_current_time()}] 服务器已同意 {requester} 的请求：取消 {target} 的管理员权限")
+                else:
+                    send_system_message(requester, f"服务器已拒绝取消 {target} 管理员权限的请求")
+                    log_queue.put(f"[{get_current_time()}] 服务器已拒绝 {requester} 的请求：取消 {target} 的管理员权限")
         self.root.after(200, self.check_refresh_event)
 
     # ========== 在线用户列表：刷新与定时 ==========
@@ -690,7 +720,20 @@ def set_admin(username):
             return
     if should_notify:
         # 给管理员本人发送私密通知
-        send_system_message(username, "你已经被设为管理员，输入“kick 用户名”踢人，输入“ban 用户名”拉黑")
+        send_system_message(
+            username,
+            "你已经被设为管理员。可用指令：\n"
+            "kick 用户名 —— 踢出用户\n"
+            "ban 用户名 —— 拉黑用户\n"
+            "unban 用户名 —— 解除拉黑\n"
+            "banip ipmode IP —— 封禁指定IP\n"
+            "banip usermode 用户名 —— 封禁指定用户的IP\n"
+            "unbanip ipmode IP —— 解除封禁指定IP\n"
+            "unbanip usermode 用户名 —— 解除封禁指定用户的IP\n"
+            "admin new 用户名 —— 请求将用户设为管理员（需服务器确认）\n"
+            "admin cancel 用户名 —— 请求取消用户的管理员权限（需服务器确认）\n"
+            "close —— 请求关闭服务器"
+        )
         # 广播给所有人
         broadcast_message("系统", f"{username} 已被设为管理员")
         log_queue.put(f"[{get_current_time()}] 用户 {username} 被设为管理员")
@@ -817,15 +860,46 @@ def handle_client(client_socket, addr):
                     is_admin = username in admins
 
                 if is_admin:
-                    # 处理踢人命令
-                    if content.startswith("kick "):
+                    stripped = content.strip()
+
+                    # ============ 关闭服务器请求 ============
+                    if stripped == "close":
+                        send_system_message(username, "已发送关闭服务器请求，等待服务器管理员确认...")
+                        log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求关闭服务器，已通知GUI弹窗确认")
+                        close_requested.set()
+
+                    # ============ 请求将用户设为管理员（需服务器确认） ============
+                    elif stripped.startswith("admin new "):
+                        parts = stripped.split()
+                        if len(parts) == 3:
+                            target = parts[2]
+                            admin_request_queue.put(("new", target, username))
+                            send_system_message(username, f"已发送将 {target} 设为管理员的请求，等待服务器确认...")
+                            log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求将 {target} 设为管理员（等待GUI确认）")
+                        else:
+                            send_system_message(username, "格式错误，请使用: admin new 用户名")
+
+                    # ============ 请求取消用户管理员权限（需服务器确认） ============
+                    elif stripped.startswith("admin cancel "):
+                        parts = stripped.split()
+                        if len(parts) == 3:
+                            target = parts[2]
+                            admin_request_queue.put(("cancel", target, username))
+                            send_system_message(username, f"已发送取消 {target} 管理员权限的请求，等待服务器确认...")
+                            log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求取消 {target} 的管理员权限（等待GUI确认）")
+                        else:
+                            send_system_message(username, "格式错误，请使用: admin cancel 用户名")
+
+                    # ============ 踢人命令 ============
+                    elif content.startswith("kick "):
                         parts = content.split()
                         if len(parts) == 2:
                             target = parts[1]
                             kick_user(target)
                         else:
                             send_system_message(username, "格式错误，请使用: kick 用户名")
-                    # 处理拉黑命令
+
+                    # ============ 拉黑命令 ============
                     elif content.startswith("ban "):
                         parts = content.split()
                         if len(parts) == 2:
@@ -833,6 +907,61 @@ def handle_client(client_socket, addr):
                             ban_user(target)
                         else:
                             send_system_message(username, "格式错误，请使用: ban 用户名")
+
+                    # ============ 解除拉黑命令 ============
+                    elif content.startswith("unban "):
+                        parts = content.split()
+                        if len(parts) == 2:
+                            target = parts[1]
+                            unban_user(target)
+                            send_system_message(username, f"已解除对用户 {target} 的拉黑")
+                        else:
+                            send_system_message(username, "格式错误，请使用: unban 用户名")
+
+                    # ============ 封禁IP命令 ============
+                    elif content.startswith("banip "):
+                        parts = content.split()
+                        if len(parts) == 3:
+                            mode = parts[1]
+                            target = parts[2]
+                            if mode == "ipmode":
+                                ban_ip(target)
+                                send_system_message(username, f"已封禁IP：{target}")
+                            elif mode == "usermode":
+                                with lock:
+                                    ip = clients[target][1][0] if target in clients else None
+                                if ip:
+                                    ban_ip(ip)
+                                    send_system_message(username, f"已封禁用户 {target} 的IP：{ip}")
+                                else:
+                                    send_system_message(username, f"无法封禁：用户 {target} 不在线或不存在")
+                            else:
+                                send_system_message(username, "格式错误，请使用: banip ipmode IP 或 banip usermode 用户名")
+                        else:
+                            send_system_message(username, "格式错误，请使用: banip ipmode IP 或 banip usermode 用户名")
+
+                    # ============ 解除IP封禁命令 ============
+                    elif content.startswith("unbanip "):
+                        parts = content.split()
+                        if len(parts) == 3:
+                            mode = parts[1]
+                            target = parts[2]
+                            if mode == "ipmode":
+                                unban_ip(target)
+                                send_system_message(username, f"已解除封禁IP：{target}")
+                            elif mode == "usermode":
+                                with lock:
+                                    ip = clients[target][1][0] if target in clients else None
+                                if ip:
+                                    unban_ip(ip)
+                                    send_system_message(username, f"已解除封禁用户 {target} 的IP：{ip}")
+                                else:
+                                    send_system_message(username, f"无法解除：用户 {target} 不在线或不存在")
+                            else:
+                                send_system_message(username, "格式错误，请使用: unbanip ipmode IP 或 unbanip usermode 用户名")
+                        else:
+                            send_system_message(username, "格式错误，请使用: unbanip ipmode IP 或 unbanip usermode 用户名")
+
                     else:
                         # 普通消息
                         broadcast_message(username, content)
