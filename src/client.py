@@ -148,7 +148,7 @@ class ChatClient:
         frame.bind("<MouseWheel>", on_wheel)
         popup.bind("<MouseWheel>", on_wheel)
 
-        cols = 12
+        cols = 9
         for idx, em in enumerate(emojis):
             btn = tk.Button(
                 frame, text=em, font=("Segoe UI Emoji", 16), width=3, height=1,
