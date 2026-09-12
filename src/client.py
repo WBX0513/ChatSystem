@@ -101,38 +101,70 @@ class ChatClient:
         self.msg_text.bind("<Return>", self.handle_enter)
         self.msg_text.bind("<Shift-Return>", self.handle_shift_enter)
     
-    # ===== 新增：微信式Emoji弹窗核心功能（不影响任何原版逻辑）=====
+    # ===== 升级：超大表情面板 + 海量Emoji =====
     def show_emoji_popup(self):
-        """弹出Emoji选择窗口，完整显示所有表情"""
+        """弹出超大Emoji选择窗口，海量表情可选"""
+        # 扩充至96个常用Emoji，分类更丰富
         emojis = [
-            "😊", "😂", "🤔", "👍", "❤️", "🎉", "🔥", "😢",
-            "😮", "😡", "😜", "🤗", "🤩", "🥳", "😇", "🙏"
+            # 笑脸情绪
+            "😊", "😂", "🤣", "😃", "😄", "😅", "😆", "😉",
+            "😇", "😍", "🤩", "😘", "😗", "😙", "😚", "🙂",
+            # 搞怪表情
+            "🤔", "🤨", "😐", "😑", "😶", "🙄", "😏", "😜",
+            "😝", "😛", "🤪", "🤩", "🥳", "😎", "🤓", "🥺",
+            # 负面情绪
+            "😢", "😭", "😤", "😠", "😡", "🤬", "😔", "😟",
+            "😕", "🙁", "☹️", "😮", "😯", "😲", "😳", "🥴",
+            # 手势动作
+            "👍", "👎", "✊", "✌️", "🤞", "🤝", "🙏", "👏",
+            "🙌", "🤲", "🤚", "🖐️", "🖖", "👌", "🤏", "✋",
+            # 爱心情感
+            "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "💔",
+            "💕", "💞", "💓", "💗", "💖", "💘", "💝", "💟",
+            # 节日物品
+            "🎉", "🎊", "🎈", "🎂", "🎁", "🎀", "🏆", "🎵",
+            "🎶", "🔥", "💯", "⭐", "🌟", "✨", "💫", "🌙"
         ]
         popup = tk.Toplevel(self.root)
-        popup.title("表情")
-        # 调整弹窗尺寸，适配2行8列
-        popup.geometry("360x160")
+        popup.title("表情面板")
+        # 扩大窗口尺寸：480x320，更大更舒适
+        popup.geometry("480x320")
         popup.resizable(False, False)
         popup.transient(self.root)
-        # 调整弹窗位置，避免遮挡输入框
-        popup.geometry(f"+{self.root.winfo_x()+30}+{self.root.winfo_y()+350}")
+        # 优化弹窗位置
+        popup.geometry(f"+{self.root.winfo_x()+10}+{self.root.winfo_y()+300}")
         
-        emoji_frame = tk.Frame(popup, bg="#f5f5f5")
-        emoji_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        
-        # 2行8列布局，完整显示所有表情
+        # 滚动框架 + 表情容器
+        canvas = tk.Canvas(popup)
+        scrollbar = tk.Scrollbar(popup, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True, padx=2, pady=2)
+        scrollbar.pack(side="right", fill="y")
+
+        # 12列布局，自动换行
+        cols = 12
         for idx, emoji in enumerate(emojis):
             btn = tk.Button(
-                emoji_frame,
+                scrollable_frame,
                 text=emoji,
-                font=("Segoe UI Emoji", 14),
+                font=("Segoe UI Emoji", 16),
                 width=3,
                 height=1,
                 bg="white",
-                fg="#333",
+                relief=tk.FLAT,
+                bd=1,
                 command=lambda e=emoji, p=popup: [self.insert_emoji(e), p.destroy()]
             )
-            btn.grid(row=idx//8, column=idx%8, padx=3, pady=3)
+            btn.grid(row=idx//cols, column=idx%cols, padx=3, pady=3)
     
     def insert_emoji(self, emoji):
         """将选中的Emoji插入输入框，保持光标位置"""
