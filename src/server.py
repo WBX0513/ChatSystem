@@ -2,6 +2,7 @@ import socket
 import threading
 import json
 import time
+import base64
 from datetime import datetime
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, ttk, filedialog
@@ -11,11 +12,15 @@ import os
 # 服务器配置
 HOST = '0.0.0.0'
 PORT = 9999
+MAX_FILE_SIZE = 20 * 1024 * 1024          # 单个文件最大 20MB
+MAX_STORE_SIZE = 200 * 1024 * 1024        # 服务器文件缓存总上限 200MB
+FILE_EXPIRE_SECONDS = 3600                # 文件缓存 1 小时后自动清理
+
 clients = {}               # {用户名: (socket, 地址)}
 banned_users = set()       # 被拉黑的用户名集合
 banned_ips = set()         # 被封禁的IP地址集合
 admins = set()             # 管理员用户名集合
-lock = threading.Lock()    # 保护共享数据
+lock = threading.RLock()   # 保护共享数据
 server_running = True
 server_socket = None
 log_queue = queue.Queue()  # 用于线程安全的日志输出
@@ -25,6 +30,54 @@ log_records = []           # 全局日志记录存储
 refresh_event = threading.Event()  # 有列表变化时通知GUI立即刷新
 close_requested = threading.Event()  # 客户端请求关闭服务器时通知GUI弹窗
 admin_request_queue = queue.Queue()  # 管理员变更请求队列（需服务器GUI确认）
+
+# 文件缓存相关
+file_store = {}            # {file_id: {'filename', 'size', 'data', 'sender', 'time', 'ts'}}
+upload_sessions = {}       # {file_id: {'filename','size','total_chunks','chunks','received','sender'}}
+
+# 每个 socket 一把发送锁，避免多线程并发 send 造成数据交错
+_sock_locks = {}
+_sock_locks_guard = threading.Lock()
+
+
+def _get_sock_lock(sock):
+    with _sock_locks_guard:
+        lk = _sock_locks.get(id(sock))
+        if lk is None:
+            lk = threading.Lock()
+            _sock_locks[id(sock)] = lk
+        return lk
+
+
+# ---------- 通用工具 ----------
+def get_current_time():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_size(num_bytes):
+    """把字节数格式化成易读字符串"""
+    try:
+        num_bytes = float(num_bytes)
+    except (TypeError, ValueError):
+        return "未知大小"
+    if num_bytes < 1024:
+        return f"{int(num_bytes)} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    if num_bytes < 1024 * 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.2f} MB"
+    return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def send_json(sock, data):
+    """以「一行一条 JSON」的协议发送数据（线程安全）"""
+    try:
+        payload = (json.dumps(data, ensure_ascii=False) + '\n').encode('utf-8')
+        with _get_sock_lock(sock):
+            sock.sendall(payload)
+        return True
+    except Exception:
+        return False
 
 
 class ServerGUI:
@@ -71,7 +124,7 @@ class ServerGUI:
         log_frame = tk.LabelFrame(left_panel, text="服务器日志", font=('Arial', 11, 'bold'),
                                    bg='#f0f0f0', padx=5, pady=5)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        
+
         # 日志操作按钮
         log_btn_frame = tk.Frame(log_frame, bg='#f0f0f0')
         log_btn_frame.pack(fill=tk.X, pady=5)
@@ -79,7 +132,7 @@ class ServerGUI:
                   command=self.save_log).pack(side=tk.LEFT, padx=2)
         tk.Button(log_btn_frame, text="清空日志", bg='#e74c3c', fg='white',
                   command=self.clear_log).pack(side=tk.LEFT, padx=2)
-        
+
         self.log_area = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD,
                                                    font=('Consolas', 10), bg='white', height=12)
         self.log_area.pack(fill=tk.BOTH, expand=True)
@@ -88,7 +141,7 @@ class ServerGUI:
         message_frame = tk.LabelFrame(left_panel, text="消息监控", font=('Arial', 11, 'bold'),
                                       bg='#f0f0f0', padx=5, pady=5)
         message_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
+
         # 聊天记录操作按钮
         chat_btn_frame = tk.Frame(message_frame, bg='#f0f0f0')
         chat_btn_frame.pack(fill=tk.X, pady=5)
@@ -96,7 +149,7 @@ class ServerGUI:
                   command=self.save_chat_records).pack(side=tk.LEFT, padx=2)
         tk.Button(chat_btn_frame, text="清空聊天记录", bg='#e74c3c', fg='white',
                   command=self.clear_chat_records).pack(side=tk.LEFT, padx=2)
-        
+
         self.message_area = scrolledtext.ScrolledText(message_frame, wrap=tk.WORD,
                                                        font=('Consolas', 10), bg='#f8f9fa', height=8)
         self.message_area.pack(fill=tk.BOTH, expand=True)
@@ -452,12 +505,9 @@ class ServerGUI:
                 "content": notice_content,
                 "time": get_current_time()
             }
-            notice_json = json.dumps(notice_data, ensure_ascii=False)
             # 广播公告给所有在线用户
             for username, (client_socket, addr) in list(clients.items()):
-                try:
-                    client_socket.send(notice_json.encode('utf-8'))
-                except:
+                if not send_json(client_socket, notice_data):
                     self.log(f"[{get_current_time()}] 向 {username} 发送公告失败")
         self.log(f"[{get_current_time()}] 发送公告：{notice_content}")
         self.notice_entry.delete(0, tk.END)
@@ -525,10 +575,6 @@ class ServerGUI:
 
 
 # ---------- 核心功能函数 ----------
-def get_current_time():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def send_system_message(target_username, content):
     """发送系统消息给指定用户"""
     with lock:
@@ -538,10 +584,7 @@ def send_system_message(target_username, content):
                 "content": content,
                 "time": get_current_time()
             }
-            msg_json = json.dumps(msg_data, ensure_ascii=False)
-            try:
-                clients[target_username][0].send(msg_json.encode('utf-8'))
-            except:
+            if not send_json(clients[target_username][0], msg_data):
                 log_queue.put(f"[{get_current_time()}] 发送系统消息给 {target_username} 失败")
 
 
@@ -554,19 +597,16 @@ def broadcast_message(sender, message):
             "content": message,
             "time": get_current_time()
         }
-        msg_json = json.dumps(msg_data, ensure_ascii=False)
-        
+
         # 记录聊天记录
         chat_record = f"[{msg_data['time']}] {sender}：{message}"
         chat_records.append(chat_record)
-        
+
         for username, (client_socket, addr) in list(clients.items()):
             if username != sender:
-                try:
-                    client_socket.send(msg_json.encode('utf-8'))
-                except:
+                if not send_json(client_socket, msg_data):
                     log_queue.put(f"[{get_current_time()}] 客户端 {username} 连接异常，已移除")
-                    del clients[username]
+                    clients.pop(username, None)
         # 将消息添加到消息队列供GUI显示
         message_queue.put(msg_data)
 
@@ -580,20 +620,187 @@ def admin_broadcast(message):
             "content": message,
             "time": get_current_time()
         }
-        msg_json = json.dumps(msg_data, ensure_ascii=False)
-        
+
         # 记录聊天记录
         chat_record = f"[{msg_data['time']}] 管理员：{message}"
         chat_records.append(chat_record)
-        
+
         for username, (client_socket, addr) in list(clients.items()):
-            try:
-                client_socket.send(msg_json.encode('utf-8'))
-            except:
+            if not send_json(client_socket, msg_data):
                 log_queue.put(f"[{get_current_time()}] 客户端 {username} 连接异常，已移除")
-                del clients[username]
+                clients.pop(username, None)
         log_queue.put(f"[{get_current_time()}] 管理员广播: {message}")
         message_queue.put(msg_data)
+
+
+# ---------- 文件相关 ----------
+def handle_file_upload_start(username, msg_data):
+    file_id = msg_data.get('file_id')
+    filename = msg_data.get('filename', 'unknown')
+    try:
+        size = int(msg_data.get('size', 0))
+        total = int(msg_data.get('total_chunks', 0))
+    except (TypeError, ValueError):
+        return
+    if not file_id or total <= 0:
+        return
+    if size > MAX_FILE_SIZE:
+        send_system_message(username, f"文件过大（最大 {format_size(MAX_FILE_SIZE)}），已拒绝")
+        return
+    with lock:
+        # 统计当前占用
+        current_total = sum(f['size'] for f in file_store.values())
+        pending = sum(s['size'] for s in upload_sessions.values())
+        if current_total + pending + size > MAX_STORE_SIZE:
+            send_system_message(username, "服务器文件缓存空间不足，请稍后再试")
+            return
+        upload_sessions[file_id] = {
+            'filename': filename,
+            'size': size,
+            'total_chunks': total,
+            'chunks': [None] * total,
+            'received': 0,
+            'sender': username
+        }
+
+
+def handle_file_upload_chunk(username, msg_data):
+    file_id = msg_data.get('file_id')
+    try:
+        index = int(msg_data.get('index', -1))
+    except (TypeError, ValueError):
+        return
+    data_b64 = msg_data.get('data', '')
+    with lock:
+        session = upload_sessions.get(file_id)
+        if not session or session['sender'] != username:
+            return
+        if not (0 <= index < session['total_chunks']):
+            return
+        if session['chunks'][index] is None:
+            session['chunks'][index] = data_b64
+            session['received'] += 1
+
+
+def handle_file_upload_end(username, msg_data):
+    file_id = msg_data.get('file_id')
+    with lock:
+        session = upload_sessions.pop(file_id, None)
+    if not session or session['sender'] != username:
+        return
+    if session['received'] != session['total_chunks']:
+        send_system_message(username, "文件上传不完整，已取消")
+        return
+    try:
+        raw = b''.join(base64.b64decode(c) for c in session['chunks'])
+    except Exception as e:
+        send_system_message(username, f"文件数据损坏：{e}")
+        return
+
+    now = time.time()
+    with lock:
+        file_store[file_id] = {
+            'filename': session['filename'],
+            'size': len(raw),
+            'data': raw,
+            'sender': username,
+            'time': get_current_time(),
+            'ts': now
+        }
+        targets = [(u, s) for u, (s, a) in clients.items() if u != username]
+
+    # 广播文件摘要给其他在线用户（让他们点击下载）
+    offer = {
+        'type': 'file_offer',
+        'file_id': file_id,
+        'filename': session['filename'],
+        'size': len(raw),
+        'sender': username,
+        'time': get_current_time()
+    }
+    for _u, sock in targets:
+        send_json(sock, offer)
+
+    size_str = format_size(len(raw))
+    info = f"[{get_current_time()}] {username} 上传文件：{session['filename']}（{size_str}）"
+    chat_records.append(info)
+    log_queue.put(info)
+    message_queue.put({
+        'time': get_current_time(),
+        'sender': username,
+        'content': f"[文件] {session['filename']}（{size_str}）"
+    })
+
+
+def _send_file_to_client(target_sock, info, file_id):
+    """在单独线程中把文件分块发送给指定客户端"""
+    data = info['data']
+    chunk_size = 3 * 1024  # 二进制 3KB，base64 后约 4KB
+    total = (len(data) + chunk_size - 1) // chunk_size
+    if not send_json(target_sock, {
+        'type': 'file_download_start',
+        'file_id': file_id,
+        'filename': info['filename'],
+        'size': info['size'],
+        'total_chunks': total
+    }):
+        return
+    for i in range(total):
+        chunk = data[i * chunk_size:(i + 1) * chunk_size]
+        if not send_json(target_sock, {
+            'type': 'file_download_chunk',
+            'file_id': file_id,
+            'index': i,
+            'data': base64.b64encode(chunk).decode('ascii')
+        }):
+            return
+    send_json(target_sock, {'type': 'file_download_end', 'file_id': file_id})
+
+
+def handle_file_download_request(username, msg_data):
+    file_id = msg_data.get('file_id')
+    with lock:
+        info = file_store.get(file_id)
+        target_sock = clients.get(username, (None,))[0]
+    if not info:
+        send_system_message(username, "文件不存在或已过期")
+        return
+    if not target_sock:
+        return
+    t = threading.Thread(target=_send_file_to_client,
+                         args=(target_sock, info, file_id), daemon=True)
+    t.start()
+    log_queue.put(f"[{get_current_time()}] {username} 请求下载文件：{info['filename']}")
+
+
+def cleanup_file_store():
+    """后台线程：定期清理过期或超量文件"""
+    while True:
+        time.sleep(300)
+        try:
+            now = time.time()
+            with lock:
+                expired = [fid for fid, info in file_store.items()
+                           if now - info.get('ts', now) > FILE_EXPIRE_SECONDS]
+                for fid in expired:
+                    file_store.pop(fid, None)
+                if expired:
+                    log_queue.put(f"[{get_current_time()}] 已清理 {len(expired)} 个过期文件缓存")
+
+                total = sum(info['size'] for info in file_store.values())
+                if total > MAX_STORE_SIZE:
+                    items = sorted(file_store.items(), key=lambda kv: kv[1].get('ts', 0))
+                    removed = 0
+                    for fid, info in items:
+                        if total <= MAX_STORE_SIZE * 0.8:
+                            break
+                        total -= info['size']
+                        file_store.pop(fid, None)
+                        removed += 1
+                    if removed:
+                        log_queue.put(f"[{get_current_time()}] 文件缓存超限，已清理 {removed} 个最旧文件")
+        except Exception:
+            pass
 
 
 def kick_user(target_username):
@@ -603,20 +810,16 @@ def kick_user(target_username):
             log_queue.put(f"[{get_current_time()}] 用户 {target_username} 不存在或已离线")
             return False
         client_socket, addr = clients[target_username]
-        try:
-            kick_msg = json.dumps({
-                "type": "system",
-                "content": "你已被管理员踢出服务器！",
-                "time": get_current_time()
-            }, ensure_ascii=False)
-            client_socket.send(kick_msg.encode('utf-8'))
-        except:
-            pass
+        send_json(client_socket, {
+            "type": "system",
+            "content": "你已被管理员踢出服务器！",
+            "time": get_current_time()
+        })
         try:
             client_socket.close()
-        except:
+        except Exception:
             pass
-        del clients[target_username]
+        clients.pop(target_username, None)
     broadcast_message("系统", f"{target_username} 已被管理员踢出！当前在线人数：{len(clients)}")
     log_queue.put(f"[{get_current_time()}] 已踢出用户 {target_username}")
     refresh_event.set()   # 触发GUI立即刷新
@@ -630,20 +833,16 @@ def ban_user(target_username):
         banned_users.add(target_username)
         if target_username in clients:
             client_socket, addr = clients[target_username]
-            try:
-                ban_msg = json.dumps({
-                    "type": "system",
-                    "content": "你已被管理员拉黑，无法继续使用！",
-                    "time": get_current_time()
-                }, ensure_ascii=False)
-                client_socket.send(ban_msg.encode('utf-8'))
-            except:
-                pass
+            send_json(client_socket, {
+                "type": "system",
+                "content": "你已被管理员拉黑，无法继续使用！",
+                "time": get_current_time()
+            })
             try:
                 client_socket.close()
-            except:
+            except Exception:
                 pass
-            del clients[target_username]
+            clients.pop(target_username, None)
             kicked = True
     if kicked:
         broadcast_message("系统", f"{target_username} 已被管理员拉黑并踢出！当前在线人数：{len(clients)}")
@@ -672,23 +871,19 @@ def ban_ip(ip_address):
         to_remove = []
         for username, (client_socket, addr) in list(clients.items()):
             if addr[0] == ip_address:
-                try:
-                    ban_msg = json.dumps({
-                        "type": "system",
-                        "content": "你的IP已被封禁，连接即将断开。",
-                        "time": get_current_time()
-                    }, ensure_ascii=False)
-                    client_socket.send(ban_msg.encode('utf-8'))
-                except:
-                    pass
+                send_json(client_socket, {
+                    "type": "system",
+                    "content": "你的IP已被封禁，连接即将断开。",
+                    "time": get_current_time()
+                })
                 try:
                     client_socket.close()
-                except:
+                except Exception:
                     pass
                 to_remove.append(username)
                 kicked_any = True
         for username in to_remove:
-            del clients[username]
+            clients.pop(username, None)
     if kicked_any:
         broadcast_message("系统", f"IP {ip_address} 已被封禁，相关用户已断开。当前在线人数：{len(clients)}")
         log_queue.put(f"[{get_current_time()}] IP {ip_address} 已被封禁，并踢出所有在线用户")
@@ -769,217 +964,262 @@ def shutdown_server():
             "content": "服务器即将关闭，连接断开。",
             "time": get_current_time()
         }
-        msg_json = json.dumps(shutdown_msg, ensure_ascii=False)
         for username, (client_socket, addr) in list(clients.items()):
-            try:
-                client_socket.send(msg_json.encode('utf-8'))
-            except:
-                pass
+            send_json(client_socket, shutdown_msg)
             try:
                 client_socket.close()
-            except:
+            except Exception:
                 pass
         clients.clear()
+        file_store.clear()
+        upload_sessions.clear()
     if server_socket:
-        server_socket.close()
+        try:
+            server_socket.close()
+        except Exception:
+            pass
     log_queue.put(f"[{get_current_time()}] 服务器关闭程序已执行。")
 
 
-def handle_client(client_socket, addr):
-    username = None
-    last_msg_time = time.time()
-    char_count = 0
-    client_ip = addr[0]
+# ---------- 客户端消息处理 ----------
+def _process_message(username, msg_data):
+    """处理一条来自客户端的消息"""
+    msg_type = msg_data.get('type')
 
-    # 首先检查IP是否被封禁
+    # 文件上传相关
+    if msg_type == 'file_upload_start':
+        handle_file_upload_start(username, msg_data)
+        return
+    if msg_type == 'file_upload_chunk':
+        handle_file_upload_chunk(username, msg_data)
+        return
+    if msg_type == 'file_upload_end':
+        handle_file_upload_end(username, msg_data)
+        return
+    if msg_type == 'file_download_request':
+        handle_file_download_request(username, msg_data)
+        return
+
+    if msg_type != 'message':
+        return
+
+    content = msg_data.get("content", "")
+    if not isinstance(content, str):
+        content = str(content)
+
     with lock:
-        if client_ip in banned_ips:
+        is_admin = username in admins
+
+    if not is_admin:
+        broadcast_message(username, content)
+        return
+
+    stripped = content.strip()
+
+    # ============ 关闭服务器请求 ============
+    if stripped == "close":
+        send_system_message(username, "已发送关闭服务器请求，等待服务器管理员确认...")
+        log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求关闭服务器，已通知GUI弹窗确认")
+        close_requested.set()
+
+    # ============ 请求将用户设为管理员（需服务器确认） ============
+    elif stripped.startswith("admin new "):
+        parts = stripped.split()
+        if len(parts) == 3:
+            target = parts[2]
+            admin_request_queue.put(("new", target, username))
+            send_system_message(username, f"已发送将 {target} 设为管理员的请求，等待服务器确认...")
+            log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求将 {target} 设为管理员（等待GUI确认）")
+        else:
+            send_system_message(username, "格式错误，请使用: admin new 用户名")
+
+    # ============ 请求取消用户管理员权限（需服务器确认） ============
+    elif stripped.startswith("admin cancel "):
+        parts = stripped.split()
+        if len(parts) == 3:
+            target = parts[2]
+            admin_request_queue.put(("cancel", target, username))
+            send_system_message(username, f"已发送取消 {target} 管理员权限的请求，等待服务器确认...")
+            log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求取消 {target} 的管理员权限（等待GUI确认）")
+        else:
+            send_system_message(username, "格式错误，请使用: admin cancel 用户名")
+
+    # ============ 踢人命令 ============
+    elif stripped.startswith("kick "):
+        parts = stripped.split()
+        if len(parts) == 2:
+            kick_user(parts[1])
+        else:
+            send_system_message(username, "格式错误，请使用: kick 用户名")
+
+    # ============ 拉黑命令 ============
+    elif stripped.startswith("ban "):
+        parts = stripped.split()
+        if len(parts) == 2:
+            ban_user(parts[1])
+        else:
+            send_system_message(username, "格式错误，请使用: ban 用户名")
+
+    # ============ 解除拉黑命令 ============
+    elif stripped.startswith("unban "):
+        parts = stripped.split()
+        if len(parts) == 2:
+            target = parts[1]
+            unban_user(target)
+            send_system_message(username, f"已解除对用户 {target} 的拉黑")
+        else:
+            send_system_message(username, "格式错误，请使用: unban 用户名")
+
+    # ============ 封禁IP命令 ============
+    elif stripped.startswith("banip "):
+        parts = stripped.split()
+        if len(parts) == 3:
+            mode = parts[1]
+            target = parts[2]
+            if mode == "ipmode":
+                ban_ip(target)
+                send_system_message(username, f"已封禁IP：{target}")
+            elif mode == "usermode":
+                with lock:
+                    ip = clients[target][1][0] if target in clients else None
+                if ip:
+                    ban_ip(ip)
+                    send_system_message(username, f"已封禁用户 {target} 的IP：{ip}")
+                else:
+                    send_system_message(username, f"无法封禁：用户 {target} 不在线或不存在")
+            else:
+                send_system_message(username, "格式错误，请使用: banip ipmode IP 或 banip usermode 用户名")
+        else:
+            send_system_message(username, "格式错误，请使用: banip ipmode IP 或 banip usermode 用户名")
+
+    # ============ 解除IP封禁命令 ============
+    elif stripped.startswith("unbanip "):
+        parts = stripped.split()
+        if len(parts) == 3:
+            mode = parts[1]
+            target = parts[2]
+            if mode == "ipmode":
+                unban_ip(target)
+                send_system_message(username, f"已解除封禁IP：{target}")
+            elif mode == "usermode":
+                with lock:
+                    ip = clients[target][1][0] if target in clients else None
+                if ip:
+                    unban_ip(ip)
+                    send_system_message(username, f"已解除封禁用户 {target} 的IP：{ip}")
+                else:
+                    send_system_message(username, f"无法解除：用户 {target} 不在线或不存在")
+            else:
+                send_system_message(username, "格式错误，请使用: unbanip ipmode IP 或 unbanip usermode 用户名")
+        else:
+            send_system_message(username, "格式错误，请使用: unbanip ipmode IP 或 unbanip usermode 用户名")
+
+    else:
+        # 普通消息
+        broadcast_message(username, content)
+
+
+def handle_client(client_socket, addr):
+    """处理单个客户端连接"""
+    username = None
+    client_ip = addr[0]
+    buffer = ""          # 按行分包的接收缓冲
+
+    def read_message(timeout=None):
+        """读取下一条完整 JSON 消息；返回 None 表示连接断开或超时"""
+        nonlocal buffer
+        try:
+            client_socket.settimeout(timeout)
+        except OSError:
+            return None
+        while '\n' not in buffer:
             try:
-                resp = json.dumps({
-                    "type": "error",
-                    "msg": "你的IP已被封禁，无法连接！"
-                }, ensure_ascii=False)
-                client_socket.send(resp.encode('utf-8'))
-            except:
-                pass
-            client_socket.close()
-            return
+                chunk = client_socket.recv(65536).decode('utf-8', errors='ignore')
+            except socket.timeout:
+                return None
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buffer += chunk
+        line, buffer = buffer.split('\n', 1)
+        line = line.strip()
+        if not line:
+            return {}
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return {}
 
     try:
-        # 接收用户名
-        username_data = client_socket.recv(1024).decode('utf-8')
-        username = json.loads(username_data)["username"]
+        # ---------- 首先检查IP是否被封禁 ----------
+        with lock:
+            ip_banned = client_ip in banned_ips
+        if ip_banned:
+            send_json(client_socket, {"type": "error", "msg": "你的IP已被封禁，无法连接！"})
+            return
+
+        # ---------- 接收用户名 ----------
+        login_data = read_message(timeout=30)
+        if not login_data or "username" not in login_data:
+            return
+        username = str(login_data["username"]).strip()
+        if not username:
+            return
 
         with lock:
-            # 检查用户名黑名单
-            if username in banned_users:
-                resp = json.dumps({
-                    "type": "error",
-                    "msg": "你已被拉黑，无法登录！"
-                }, ensure_ascii=False)
-                client_socket.send(resp.encode('utf-8'))
-                client_socket.close()
-                return
+            banned = username in banned_users
+            duplicated = username in clients
 
-            # 检查用户名是否已存在
-            if username in clients:
-                resp = json.dumps({"type": "error", "msg": "用户名已存在！"}, ensure_ascii=False)
-                client_socket.send(resp.encode('utf-8'))
-                client_socket.close()
-                return
+        if banned:
+            send_json(client_socket, {"type": "error", "msg": "你已被拉黑，无法登录！"})
+            return
+        if duplicated:
+            send_json(client_socket, {"type": "error", "msg": "用户名已存在！"})
+            return
 
+        with lock:
             clients[username] = (client_socket, addr)
 
         broadcast_message("系统", f"{username} 已上线！当前在线人数：{len(clients)}")
         log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已连接，当前在线：{len(clients)}")
         refresh_event.set()   # 有用户加入，立即刷新在线用户列表
 
+        # ---------- 消息主循环 ----------
         while server_running:
+            msg_data = read_message()
+            if msg_data is None:
+                break
+            if not msg_data:
+                continue
             try:
-                msg = client_socket.recv(1024).decode('utf-8')
-            except:
-                break
-            if not msg:
-                break
-
-            msg_data = json.loads(msg)
-            if msg_data["type"] == "message":
-                content = msg_data["content"]
-                now = time.time()
-
-                # 简单的速率限制
-                if now - last_msg_time <= 1.0:
-                    char_count += 1
-                else:
-                    char_count += 1
-                    last_msg_time = now
-
-                # 检查是否是管理员命令
-                is_admin = False
-                with lock:
-                    is_admin = username in admins
-
-                if is_admin:
-                    stripped = content.strip()
-
-                    # ============ 关闭服务器请求 ============
-                    if stripped == "close":
-                        send_system_message(username, "已发送关闭服务器请求，等待服务器管理员确认...")
-                        log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求关闭服务器，已通知GUI弹窗确认")
-                        close_requested.set()
-
-                    # ============ 请求将用户设为管理员（需服务器确认） ============
-                    elif stripped.startswith("admin new "):
-                        parts = stripped.split()
-                        if len(parts) == 3:
-                            target = parts[2]
-                            admin_request_queue.put(("new", target, username))
-                            send_system_message(username, f"已发送将 {target} 设为管理员的请求，等待服务器确认...")
-                            log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求将 {target} 设为管理员（等待GUI确认）")
-                        else:
-                            send_system_message(username, "格式错误，请使用: admin new 用户名")
-
-                    # ============ 请求取消用户管理员权限（需服务器确认） ============
-                    elif stripped.startswith("admin cancel "):
-                        parts = stripped.split()
-                        if len(parts) == 3:
-                            target = parts[2]
-                            admin_request_queue.put(("cancel", target, username))
-                            send_system_message(username, f"已发送取消 {target} 管理员权限的请求，等待服务器确认...")
-                            log_queue.put(f"[{get_current_time()}] 管理员 {username} 请求取消 {target} 的管理员权限（等待GUI确认）")
-                        else:
-                            send_system_message(username, "格式错误，请使用: admin cancel 用户名")
-
-                    # ============ 踢人命令 ============
-                    elif content.startswith("kick "):
-                        parts = content.split()
-                        if len(parts) == 2:
-                            target = parts[1]
-                            kick_user(target)
-                        else:
-                            send_system_message(username, "格式错误，请使用: kick 用户名")
-
-                    # ============ 拉黑命令 ============
-                    elif content.startswith("ban "):
-                        parts = content.split()
-                        if len(parts) == 2:
-                            target = parts[1]
-                            ban_user(target)
-                        else:
-                            send_system_message(username, "格式错误，请使用: ban 用户名")
-
-                    # ============ 解除拉黑命令 ============
-                    elif content.startswith("unban "):
-                        parts = content.split()
-                        if len(parts) == 2:
-                            target = parts[1]
-                            unban_user(target)
-                            send_system_message(username, f"已解除对用户 {target} 的拉黑")
-                        else:
-                            send_system_message(username, "格式错误，请使用: unban 用户名")
-
-                    # ============ 封禁IP命令 ============
-                    elif content.startswith("banip "):
-                        parts = content.split()
-                        if len(parts) == 3:
-                            mode = parts[1]
-                            target = parts[2]
-                            if mode == "ipmode":
-                                ban_ip(target)
-                                send_system_message(username, f"已封禁IP：{target}")
-                            elif mode == "usermode":
-                                with lock:
-                                    ip = clients[target][1][0] if target in clients else None
-                                if ip:
-                                    ban_ip(ip)
-                                    send_system_message(username, f"已封禁用户 {target} 的IP：{ip}")
-                                else:
-                                    send_system_message(username, f"无法封禁：用户 {target} 不在线或不存在")
-                            else:
-                                send_system_message(username, "格式错误，请使用: banip ipmode IP 或 banip usermode 用户名")
-                        else:
-                            send_system_message(username, "格式错误，请使用: banip ipmode IP 或 banip usermode 用户名")
-
-                    # ============ 解除IP封禁命令 ============
-                    elif content.startswith("unbanip "):
-                        parts = content.split()
-                        if len(parts) == 3:
-                            mode = parts[1]
-                            target = parts[2]
-                            if mode == "ipmode":
-                                unban_ip(target)
-                                send_system_message(username, f"已解除封禁IP：{target}")
-                            elif mode == "usermode":
-                                with lock:
-                                    ip = clients[target][1][0] if target in clients else None
-                                if ip:
-                                    unban_ip(ip)
-                                    send_system_message(username, f"已解除封禁用户 {target} 的IP：{ip}")
-                                else:
-                                    send_system_message(username, f"无法解除：用户 {target} 不在线或不存在")
-                            else:
-                                send_system_message(username, "格式错误，请使用: unbanip ipmode IP 或 unbanip usermode 用户名")
-                        else:
-                            send_system_message(username, "格式错误，请使用: unbanip ipmode IP 或 unbanip usermode 用户名")
-
-                    else:
-                        # 普通消息
-                        broadcast_message(username, content)
-                else:
-                    # 普通用户消息
-                    broadcast_message(username, content)
+                _process_message(username, msg_data)
+            except Exception as e:
+                log_queue.put(f"[{get_current_time()}] 处理 {username} 的消息出错：{e}")
 
     except Exception as e:
         log_queue.put(f"[{get_current_time()}] 处理客户端 {addr} 时出错：{e}")
     finally:
-        # 清理断开连接的客户端
-        if username and username in clients:
+        # 清理该用户未完成的上传会话
+        if username:
             with lock:
-                del clients[username]
-            broadcast_message("系统", f"{username} 已下线！当前在线人数：{len(clients)}")
-            log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已断开，当前在线：{len(clients)}")
-            refresh_event.set()   # 有用户离开，立即刷新在线用户列表
-        client_socket.close()
+                to_remove = [fid for fid, s in upload_sessions.items() if s['sender'] == username]
+                for fid in to_remove:
+                    upload_sessions.pop(fid, None)
+        try:
+            client_socket.close()
+        except Exception:
+            pass
+        if username:
+            removed = False
+            with lock:
+                if username in clients:
+                    clients.pop(username, None)
+                    removed = True
+            if removed:
+                broadcast_message("系统", f"{username} 已下线！当前在线人数：{len(clients)}")
+                log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已断开，当前在线：{len(clients)}")
+                refresh_event.set()   # 有用户离开，立即刷新在线用户列表
 
 
 def start_server():
@@ -989,6 +1229,10 @@ def start_server():
     server_socket.bind((HOST, PORT))
     server_socket.listen(5)
     log_queue.put(f"[{get_current_time()}] 服务器已启动，监听地址：{HOST}:{PORT}")
+
+    # 启动文件缓存清理线程
+    cleaner = threading.Thread(target=cleanup_file_store, daemon=True)
+    cleaner.start()
 
     try:
         while server_running:
