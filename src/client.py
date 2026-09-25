@@ -192,6 +192,11 @@ class ChatClient:
         self.file_downloads = {}
         self.downloading = set()
 
+        # @ 提及相关
+        self.online_users = []      # 服务器推送的在线用户列表
+        self._mention_popup = None  # @ 选择面板
+        self._mention_tag_counter = 0
+
         self.create_ui()
 
         # 启用拖放
@@ -260,6 +265,9 @@ class ChatClient:
 
         self.msg_text.bind("<Return>", self.handle_enter)
         self.msg_text.bind("<Shift-Return>", self.handle_shift_enter)
+        # @ 提及自动补全的键盘事件
+        self.msg_text.bind("<KeyRelease>", self._on_key_release, add="+")
+        self.msg_text.bind("<Escape>", lambda e: self._hide_mention_popup(), add="+")
 
     # ---------------- 表情 ----------------
     def show_emoji_popup(self):
@@ -349,6 +357,39 @@ class ChatClient:
         self.chat_display.config(state=tk.DISABLED)
         self.chat_display.see(tk.END)
 
+    def _append_mention(self, message):
+        """被 @ 的消息：高亮显示 + 响铃 + 短暂置顶窗口提醒"""
+        self.chat_display.config(state=tk.NORMAL)
+        # 记录插入前的行号
+        before_lines = int(self.chat_display.index("end-1c").split(".")[0])
+        self.chat_display.insert(tk.END, message + "\n")
+        after_lines = int(self.chat_display.index("end-1c").split(".")[0])
+
+        self._mention_tag_counter += 1
+        tag_name = f"mention_{self._mention_tag_counter}"
+        self.chat_display.tag_add(
+            tag_name,
+            f"{before_lines + 1}.0",
+            f"{after_lines}.end",
+        )
+        self.chat_display.tag_config(
+            tag_name,
+            background='#fff3cd',
+            foreground='#856404',
+            font=('Consolas', 9, 'bold'),
+        )
+        self._trim_lines()
+        self.chat_display.config(state=tk.DISABLED)
+        self.chat_display.see(tk.END)
+
+        # 提示音 + 短暂窗口置顶
+        try:
+            self.root.bell()
+            self.root.attributes('-topmost', True)
+            self.root.after(300, lambda: self.root.attributes('-topmost', False))
+        except Exception:
+            pass
+
     def _append_file(self, data):
         file_id = data['file_id']
         filename = data['filename']
@@ -398,6 +439,8 @@ class ChatClient:
                 kind, data = self.msg_queue.get_nowait()
                 if kind == 'text':
                     self._append_text(data)
+                elif kind == 'mention':
+                    self._append_mention(data)
                 elif kind == 'file':
                     self._append_file(data)
                 elif kind == 'save_file':
@@ -490,6 +533,7 @@ class ChatClient:
         self.login_btn.config(state=tk.NORMAL)
         self.username_entry.config(state=tk.NORMAL)
         self.server_entry.config(state=tk.NORMAL)
+        self._hide_mention_popup()
 
     # ---------------- 接收 ----------------
     def receive_messages(self):
@@ -525,11 +569,21 @@ class ChatClient:
     def _dispatch_message(self, msg_data):
         t = msg_data.get('type')
         if t == 'message':
-            self.add_message(f"[{msg_data['time']}] {msg_data['sender']}：{msg_data['content']}")
+            sender = msg_data.get('sender', '')
+            content = msg_data.get('content', '')
+            mentions = msg_data.get('mentions', []) or []
+            text = f"[{msg_data.get('time', self.get_current_time())}] {sender}：{content}"
+            # 自己被 @（且不是自己发的） —— 走高亮 + 响铃通道
+            if self.username and self.username in mentions and sender != self.username:
+                self.msg_queue.put(('mention', text))
+            else:
+                self.add_message(text)
         elif t == 'system':
             self.add_message(f"[{msg_data['time']}] 系统提示：{msg_data['content']}")
         elif t == 'notice':
             self.add_message(f"[{msg_data['time']}] 服务器公告：{msg_data['content']}")
+        elif t == 'user_list':
+            self.online_users = msg_data.get('users', []) or []
         elif t == 'error':
             self.msg_queue.put(('popup', {'title': '服务器消息', 'msg': msg_data.get('msg', '未知错误')}))
         elif t == 'file_offer':
@@ -711,6 +765,79 @@ class ChatClient:
         except Exception as e:
             messagebox.showerror("错误", f"无法打开文件：{e}")
 
+    # ---------------- @提醒：自动补全 ----------------
+    def _on_key_release(self, event):
+        # 输入 @ 时弹出在线用户选择面板
+        if event.char == '@':
+            self._on_at_typed()
+        elif event.keysym == 'Escape':
+            self._hide_mention_popup()
+
+    def _on_at_typed(self):
+        if not self.is_connected:
+            return
+        candidates = [u for u in self.online_users if u != self.username]
+        if not candidates:
+            self.add_message(f"[{self.get_current_time()}] 当前没有其他在线用户可 @")
+            return
+        self._show_mention_popup(candidates)
+
+    def _show_mention_popup(self, users):
+        self._hide_mention_popup()
+        popup = tk.Toplevel(self.root)
+        popup.wm_overrideredirect(True)
+        popup.attributes('-topmost', True)
+        self._mention_popup = popup
+
+        # 定位到光标下方
+        try:
+            bbox = self.msg_text.bbox(tk.INSERT)
+            if bbox:
+                x = self.msg_text.winfo_rootx() + bbox[0]
+                y = self.msg_text.winfo_rooty() + bbox[1] + bbox[3]
+            else:
+                x = self.msg_text.winfo_rootx() + 20
+                y = self.msg_text.winfo_rooty() + 20
+        except Exception:
+            x = self.msg_text.winfo_rootx() + 20
+            y = self.msg_text.winfo_rooty() + 20
+        popup.geometry(f"+{x}+{y}")
+
+        outer = tk.Frame(popup, bg='#b0bec5', bd=1)
+        outer.pack()
+        inner = tk.Frame(outer, bg='white')
+        inner.pack(padx=1, pady=1)
+
+        tk.Label(inner, text="选择要 @ 的用户（Esc 取消）",
+                 bg='#eceff1', fg='#37474f',
+                 font=('Arial', 9), anchor='w').pack(fill=tk.X)
+
+        for u in users[:12]:
+            btn = tk.Button(inner, text=u, anchor='w', relief=tk.FLAT,
+                            bg='white', font=('Arial', 10), padx=8, pady=2,
+                            command=lambda name=u: self._insert_mention(name))
+            btn.pack(fill=tk.X)
+            btn.bind('<Enter>', lambda e, b=btn: b.config(bg='#e3f2fd'))
+            btn.bind('<Leave>', lambda e, b=btn: b.config(bg='white'))
+
+        # 保持输入焦点
+        self.msg_text.focus_set()
+
+    def _insert_mention(self, username):
+        """把 @用户名 插入到当前光标位置"""
+        self._hide_mention_popup()
+        self.msg_text.insert(tk.INSERT, f"{username} ")
+        self.msg_text.focus_set()
+
+    def _hide_mention_popup(self):
+        if self._mention_popup is not None:
+            try:
+                if self._mention_popup.winfo_exists():
+                    self._mention_popup.destroy()
+            except Exception:
+                pass
+            self._mention_popup = None
+
     # ---------------- 发送消息 ----------------
     def send_message(self, event=None):
         if not self.is_connected:
@@ -732,6 +859,7 @@ class ChatClient:
                 return
             self.msg_text.delete("1.0", tk.END)
             self.add_message(f"[{self.get_current_time()}] 我：{content}")
+            self._hide_mention_popup()
         except Exception as e:
             messagebox.showerror("错误", f"发送消息失败：{e}")
 
