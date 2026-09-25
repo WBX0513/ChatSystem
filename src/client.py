@@ -42,7 +42,7 @@ def send_json(sock, data):
 
 
 # ==================== 全局拖放状态（防止回调被 GC / 重入） ====================
-_DND_PROCS = []           # 保存 WNDPROC 回调，防止被垃圾回收
+_DND_PROCS = []             # 保存 WNDPROC 回调，防止被垃圾回收
 _DND_QUEUE = queue.Queue()  # 窗口过程只投递到这里，主线程轮询取出
 
 
@@ -193,9 +193,12 @@ class ChatClient:
         self.downloading = set()
 
         # @ 提及相关
-        self.online_users = []      # 服务器推送的在线用户列表
-        self._mention_popup = None  # @ 选择面板
-        self._mention_tag_counter = 0
+        self.online_users = []        # 服务器推送的在线用户列表
+        self._mention_popup = None    # @ 选择面板 Toplevel
+        self._mention_items = []      # 面板里可选的用户名列表（过滤后）
+        self._mention_buttons = []    # 面板里每个用户对应的按钮
+        self._mention_index = 0       # 当前高亮索引
+        self._mention_tag_counter = 0 # 高亮 tag 计数（避免重名）
 
         self.create_ui()
 
@@ -264,10 +267,17 @@ class ChatClient:
         self.msg_text.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(0, 5))
 
         self.msg_text.bind("<Return>", self.handle_enter)
+        self.msg_text.bind("<KP_Enter>", self.handle_enter)
         self.msg_text.bind("<Shift-Return>", self.handle_shift_enter)
-        # @ 提及自动补全的键盘事件
+
+        # @ 提及：每次按键都重新评估上下文（保证 @ 被删掉、光标移动、继续打字都能实时反映）
         self.msg_text.bind("<KeyRelease>", self._on_key_release, add="+")
+        self.msg_text.bind("<ButtonRelease-1>", self._on_click_release, add="+")
         self.msg_text.bind("<Escape>", lambda e: self._hide_mention_popup(), add="+")
+        self.msg_text.bind("<Up>",     self._mention_on_up,    add="+")
+        self.msg_text.bind("<Down>",   self._mention_on_down,  add="+")
+        self.msg_text.bind("<Tab>",    self._mention_on_tab,   add="+")
+        self.msg_text.bind("<space>",  self._mention_on_space, add="+")
 
     # ---------------- 表情 ----------------
     def show_emoji_popup(self):
@@ -328,6 +338,10 @@ class ChatClient:
         return "break"
 
     def handle_enter(self, event):
+        # 弹窗激活时，Enter 用来补全而不是发送
+        if self._mention_active():
+            self._complete_mention()
+            return "break"
         self.send_message()
         return "break"
 
@@ -358,9 +372,8 @@ class ChatClient:
         self.chat_display.see(tk.END)
 
     def _append_mention(self, message):
-        """被 @ 的消息：高亮显示 + 响铃 + 短暂置顶窗口提醒"""
+        """被 @ 的消息：高亮显示 + 响铃 + 恢复窗口并短暂置顶提醒"""
         self.chat_display.config(state=tk.NORMAL)
-        # 记录插入前的行号
         before_lines = int(self.chat_display.index("end-1c").split(".")[0])
         self.chat_display.insert(tk.END, message + "\n")
         after_lines = int(self.chat_display.index("end-1c").split(".")[0])
@@ -382,11 +395,37 @@ class ChatClient:
         self.chat_display.config(state=tk.DISABLED)
         self.chat_display.see(tk.END)
 
-        # 提示音 + 短暂窗口置顶
+        # 提示音 + 从最小化恢复 + 短暂置顶
         try:
             self.root.bell()
+        except Exception:
+            pass
+
+        try:
+            # 1) 若窗口处于最小化（iconic）或隐藏（withdrawn）状态，先恢复
+            try:
+                state = self.root.state()
+            except Exception:
+                state = 'normal'
+
+            if state in ('iconic', 'withdrawn'):
+                self.root.deiconify()   # 解除最小化 / 显示窗口
+                self.root.lift()        # 抬到同层窗口前面
+
+            # 2) 置顶一小段时间，给用户醒目提醒
             self.root.attributes('-topmost', True)
-            self.root.after(300, lambda: self.root.attributes('-topmost', False))
+            try:
+                self.root.focus_force()
+            except Exception:
+                pass
+            self.root.after(300, self._unset_topmost)
+        except Exception:
+            pass
+
+    def _unset_topmost(self):
+        """取消短暂置顶，避免长期干扰用户其他窗口"""
+        try:
+            self.root.attributes('-topmost', False)
         except Exception:
             pass
 
@@ -573,7 +612,6 @@ class ChatClient:
             content = msg_data.get('content', '')
             mentions = msg_data.get('mentions', []) or []
             text = f"[{msg_data.get('time', self.get_current_time())}] {sender}：{content}"
-            # 自己被 @（且不是自己发的） —— 走高亮 + 响铃通道
             if self.username and self.username in mentions and sender != self.username:
                 self.msg_queue.put(('mention', text))
             else:
@@ -584,6 +622,8 @@ class ChatClient:
             self.add_message(f"[{msg_data['time']}] 服务器公告：{msg_data['content']}")
         elif t == 'user_list':
             self.online_users = msg_data.get('users', []) or []
+            # 在线列表更新后，如果 @ 面板正在显示，用新列表重新过滤一遍
+            self._refresh_mention_from_text()
         elif t == 'error':
             self.msg_queue.put(('popup', {'title': '服务器消息', 'msg': msg_data.get('msg', '未知错误')}))
         elif t == 'file_offer':
@@ -679,7 +719,6 @@ class ChatClient:
         if not valid:
             self.add_message(f"[{self.get_current_time()}] 拖入的内容中没有有效文件")
             return
-        # 多文件直接全部发送（不用弹窗，避免嵌套事件循环）
         for path in valid:
             self._send_file_by_path(path)
 
@@ -766,28 +805,138 @@ class ChatClient:
             messagebox.showerror("错误", f"无法打开文件：{e}")
 
     # ---------------- @提醒：自动补全 ----------------
-    def _on_key_release(self, event):
-        # 输入 @ 时弹出在线用户选择面板
-        if event.char == '@':
-            self._on_at_typed()
-        elif event.keysym == 'Escape':
+    # 设计思路：每次按键/点击后，读取「光标前那段文本」判断当前是否处于 @xxx 状态。
+    #   - @xxx 中间不能出现空白；@ 后连续字符数有上限（避免误触发）
+    #   - 用 xxx 作为前缀去过滤 online_users
+    #   - 过滤到 0 个候选 或 上下文不再成立 时隐藏面板
+    def _get_mention_context(self):
+        """
+        返回 (is_active, query, at_index)：
+          is_active: 当前光标是否处于 @xxx 状态
+          query:    @ 后面到光标之间的字符串
+          at_index: '@' 在文本中的绝对索引
+        """
+        try:
+            cursor = self.msg_text.index(tk.INSERT)
+            full_prefix = self.msg_text.get("1.0", cursor)
+        except Exception:
+            return (False, '', -1)
+
+        if not full_prefix:
+            return (False, '', -1)
+
+        at_pos = full_prefix.rfind('@')
+        if at_pos == -1:
+            return (False, '', -1)
+
+        between = full_prefix[at_pos + 1:]
+
+        # @ 与光标之间有空白 → 不算 @ 上下文
+        if any(ch.isspace() for ch in between):
+            return (False, '', -1)
+
+        # 避免超长误触发（例如邮箱、长串）
+        if len(between) > 30:
+            return (False, '', -1)
+
+        # @ 前一个字符不能是字母/数字/下划线，否则很可能是邮箱之类
+        if at_pos > 0:
+            prev = full_prefix[at_pos - 1]
+            if prev.isalnum() or prev == '_':
+                return (False, '', -1)
+
+        return (True, between, at_pos)
+
+    def _mention_active(self):
+        """面板是否处于激活状态（有可选用户）"""
+        return self._mention_popup is not None and bool(self._mention_items)
+
+    def _refresh_mention_from_text(self):
+        """根据输入框当前光标上下文，刷新/隐藏 @ 面板"""
+        is_ctx, query, _ = self._get_mention_context()
+
+        if not is_ctx or not self.is_connected:
             self._hide_mention_popup()
-
-    def _on_at_typed(self):
-        if not self.is_connected:
             return
-        candidates = [u for u in self.online_users if u != self.username]
+
+        # 前缀优先匹配
+        candidates = [u for u in self.online_users
+                      if u != self.username and u.lower().startswith(query.lower())]
+        # 无前缀命中则退化为包含匹配
         if not candidates:
-            self.add_message(f"[{self.get_current_time()}] 当前没有其他在线用户可 @")
-            return
-        self._show_mention_popup(candidates)
+            candidates = [u for u in self.online_users
+                          if u != self.username and query.lower() in u.lower()]
 
-    def _show_mention_popup(self, users):
+        if not candidates:
+            self._hide_mention_popup()
+            return
+
+        # 若原来有选中项，尽量保持
+        keep_name = None
+        if self._mention_items and 0 <= self._mention_index < len(self._mention_items):
+            keep_name = self._mention_items[self._mention_index]
+
+        self._show_mention_popup(candidates, keep_name=keep_name)
+
+    # -------- 事件响应 --------
+    def _on_key_release(self, event):
+        # 这些键由专门的绑定处理，不在 KeyRelease 里重复刷新
+        if event.keysym in ('Up', 'Down', 'Tab', 'Return', 'KP_Enter', 'Escape'):
+            return
+        self._refresh_mention_from_text()
+
+    def _on_click_release(self, event):
+        # 鼠标点击后光标可能移动了，重新评估一次上下文
+        self._refresh_mention_from_text()
+
+    def _mention_on_up(self, event):
+        if not self._mention_active():
+            return None
+        self._mention_index = (self._mention_index - 1) % len(self._mention_items)
+        self._refresh_mention_highlight()
+        return "break"
+
+    def _mention_on_down(self, event):
+        if not self._mention_active():
+            return None
+        self._mention_index = (self._mention_index + 1) % len(self._mention_items)
+        self._refresh_mention_highlight()
+        return "break"
+
+    def _mention_on_tab(self, event):
+        if not self._mention_active():
+            return None
+        self._complete_mention()
+        return "break"
+
+    def _mention_on_space(self, event):
+        # 空格补全：仅在已输入了 @xxx 中至少一个字符时才补全，
+        # 否则让空格正常输入（此时 @ 后面还没写东西，用户可能只是想要个空格）
+        if not self._mention_active():
+            return None
+        is_ctx, query, _ = self._get_mention_context()
+        if not is_ctx or not query:
+            self._hide_mention_popup()
+            return None
+        self._complete_mention()
+        return "break"
+
+    # -------- 面板显示与高亮 --------
+    def _show_mention_popup(self, users, keep_name=None):
+        # 先把旧面板清掉（简单可靠，避免残留按钮）
         self._hide_mention_popup()
+
         popup = tk.Toplevel(self.root)
         popup.wm_overrideredirect(True)
         popup.attributes('-topmost', True)
         self._mention_popup = popup
+
+        self._mention_items = list(users[:12])
+        if keep_name and keep_name in self._mention_items:
+            self._mention_index = self._mention_items.index(keep_name)
+        else:
+            self._mention_index = 0
+        self._mention_buttons = []
 
         # 定位到光标下方
         try:
@@ -808,23 +957,71 @@ class ChatClient:
         inner = tk.Frame(outer, bg='white')
         inner.pack(padx=1, pady=1)
 
-        tk.Label(inner, text="选择要 @ 的用户（Esc 取消）",
+        tk.Label(inner,
+                 text="↑↓ 选择   Tab/Enter/空格 补全   Esc 取消",
                  bg='#eceff1', fg='#37474f',
                  font=('Arial', 9), anchor='w').pack(fill=tk.X)
 
-        for u in users[:12]:
+        for idx, u in enumerate(self._mention_items):
             btn = tk.Button(inner, text=u, anchor='w', relief=tk.FLAT,
-                            bg='white', font=('Arial', 10), padx=8, pady=2,
-                            command=lambda name=u: self._insert_mention(name))
+                            bg='white', font=('Arial', 10),
+                            padx=8, pady=2,
+                            command=lambda i=idx: self._insert_mention_by_index(i))
             btn.pack(fill=tk.X)
-            btn.bind('<Enter>', lambda e, b=btn: b.config(bg='#e3f2fd'))
-            btn.bind('<Leave>', lambda e, b=btn: b.config(bg='white'))
+            btn.bind('<Enter>', lambda e, i=idx: self._hover_mention(i))
+            self._mention_buttons.append(btn)
 
-        # 保持输入焦点
+        self._refresh_mention_highlight()
+        # 保持输入焦点在 Text 上
         self.msg_text.focus_set()
 
+    def _hover_mention(self, idx):
+        if not self._mention_active():
+            return
+        if 0 <= idx < len(self._mention_items):
+            self._mention_index = idx
+            self._refresh_mention_highlight()
+
+    def _refresh_mention_highlight(self):
+        for i, btn in enumerate(self._mention_buttons):
+            try:
+                btn.config(bg=('#e3f2fd' if i == self._mention_index else 'white'))
+            except Exception:
+                pass
+
+    # -------- 补全 --------
+    def _complete_mention(self):
+        if not self._mention_items:
+            self._hide_mention_popup()
+            return
+        idx = max(0, min(self._mention_index, len(self._mention_items) - 1))
+        name = self._mention_items[idx]
+        self._insert_mention(name)
+
+    def _insert_mention_by_index(self, idx):
+        """鼠标点击某一项：先同步高亮再补全"""
+        if not self._mention_items:
+            self._hide_mention_popup()
+            return
+        idx = max(0, min(idx, len(self._mention_items) - 1))
+        self._mention_index = idx
+        self._insert_mention(self._mention_items[idx])
+
     def _insert_mention(self, username):
-        """把 @用户名 插入到当前光标位置"""
+        """
+        保留 @ 符号，把 @ 后到光标之间的内容替换为完整用户名 + 空格。
+        例如当前文本是 "@zh" 且选择了 "张三"，结果是 "@张三 "。
+        """
+        is_ctx, _query, at_pos = self._get_mention_context()
+        if is_ctx and at_pos >= 0:
+            # 从 @ 的下一个字符开始删到光标，保留 @ 本身
+            start = f"1.0 + {at_pos + 1} chars"
+            end = tk.INSERT
+            try:
+                self.msg_text.delete(start, end)
+            except Exception:
+                pass
+
         self._hide_mention_popup()
         self.msg_text.insert(tk.INSERT, f"{username} ")
         self.msg_text.focus_set()
@@ -836,7 +1033,10 @@ class ChatClient:
                     self._mention_popup.destroy()
             except Exception:
                 pass
-            self._mention_popup = None
+        self._mention_popup = None
+        self._mention_items = []
+        self._mention_buttons = []
+        self._mention_index = 0
 
     # ---------------- 发送消息 ----------------
     def send_message(self, event=None):
