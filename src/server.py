@@ -3,6 +3,7 @@ import threading
 import json
 import time
 import base64
+import re
 from datetime import datetime
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, ttk, filedialog
@@ -67,6 +68,20 @@ def format_size(num_bytes):
     if num_bytes < 1024 * 1024 * 1024:
         return f"{num_bytes / (1024 * 1024):.2f} MB"
     return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def extract_mentions(content):
+    """从消息内容中提取 @用户名，按出现顺序去重返回"""
+    if not isinstance(content, str):
+        return []
+    seen = set()
+    result = []
+    for m in re.finditer(r'@([^\s@，。！？、,.!?;；:：]+)', content):
+        name = m.group(1)
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
 
 
 def send_json(sock, data):
@@ -155,7 +170,8 @@ class ServerGUI:
         self.message_area.pack(fill=tk.BOTH, expand=True)
 
         # 管理员广播区域
-        broadcast_frame = tk.LabelFrame(left_panel, text="管理员广播", font=('Arial', 11, 'bold'),
+        broadcast_frame = tk.LabelFrame(left_panel, text="管理员广播",
+                                        font=('Arial', 11, 'bold'),
                                         bg='#f0f0f0', padx=5, pady=5)
         broadcast_frame.pack(fill=tk.X, pady=5)
         broadcast_input_frame = tk.Frame(broadcast_frame, bg='#f0f0f0')
@@ -589,13 +605,15 @@ def send_system_message(target_username, content):
 
 
 def broadcast_message(sender, message):
-    """广播消息给所有在线用户（除发送者外）"""
+    """广播消息给所有在线用户（除发送者外），自动解析 @提及"""
     with lock:
+        mentions = extract_mentions(message)
         msg_data = {
             "type": "message",
             "sender": sender,
             "content": message,
-            "time": get_current_time()
+            "time": get_current_time(),
+            "mentions": mentions
         }
 
         # 记录聊天记录
@@ -610,15 +628,22 @@ def broadcast_message(sender, message):
         # 将消息添加到消息队列供GUI显示
         message_queue.put(msg_data)
 
+        # 日志记录 @ 提及情况（仅记录在线被提及用户）
+        mentioned_online = [m for m in mentions if m in clients and m != sender]
+        if mentioned_online:
+            log_queue.put(f"[{get_current_time()}] {sender} @ 了：{', '.join(mentioned_online)}")
+
 
 def admin_broadcast(message):
-    """管理员广播消息"""
+    """管理员广播消息（支持 @提及，被 @ 的客户端会高亮提醒）"""
     with lock:
+        mentions = extract_mentions(message)
         msg_data = {
             "type": "message",
             "sender": "管理员",
             "content": message,
-            "time": get_current_time()
+            "time": get_current_time(),
+            "mentions": mentions
         }
 
         # 记录聊天记录
@@ -631,6 +656,21 @@ def admin_broadcast(message):
                 clients.pop(username, None)
         log_queue.put(f"[{get_current_time()}] 管理员广播: {message}")
         message_queue.put(msg_data)
+
+        # 记录管理员 @ 了哪些在线用户
+        mentioned_online = [m for m in mentions if m in clients]
+        if mentioned_online:
+            log_queue.put(f"[{get_current_time()}] 管理员 @ 了：{', '.join(mentioned_online)}")
+
+
+def broadcast_user_list():
+    """向所有在线客户端广播当前在线用户列表（用于客户端 @ 自动补全）"""
+    with lock:
+        user_list = sorted(clients.keys())
+        targets = [(u, s) for u, (s, a) in clients.items()]
+    msg = {"type": "user_list", "users": user_list}
+    for _u, sock in targets:
+        send_json(sock, msg)
 
 
 # ---------- 文件相关 ----------
@@ -823,6 +863,7 @@ def kick_user(target_username):
     broadcast_message("系统", f"{target_username} 已被管理员踢出！当前在线人数：{len(clients)}")
     log_queue.put(f"[{get_current_time()}] 已踢出用户 {target_username}")
     refresh_event.set()   # 触发GUI立即刷新
+    broadcast_user_list() # 通知所有客户端更新在线列表
     return True
 
 
@@ -850,6 +891,7 @@ def ban_user(target_username):
     else:
         log_queue.put(f"[{get_current_time()}] 用户 {target_username} 已被拉黑（不在线）")
     refresh_event.set()   # 触发GUI立即刷新
+    broadcast_user_list()
 
 
 def unban_user(target_username):
@@ -890,6 +932,7 @@ def ban_ip(ip_address):
     else:
         log_queue.put(f"[{get_current_time()}] IP {ip_address} 已被封禁（无在线用户）")
     refresh_event.set()   # 触发GUI立即刷新
+    broadcast_user_list()
 
 
 def unban_ip(ip_address):
@@ -1184,6 +1227,7 @@ def handle_client(client_socket, addr):
         broadcast_message("系统", f"{username} 已上线！当前在线人数：{len(clients)}")
         log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已连接，当前在线：{len(clients)}")
         refresh_event.set()   # 有用户加入，立即刷新在线用户列表
+        broadcast_user_list() # 通知所有客户端（含新用户）更新在线列表
 
         # ---------- 消息主循环 ----------
         while server_running:
@@ -1220,6 +1264,7 @@ def handle_client(client_socket, addr):
                 broadcast_message("系统", f"{username} 已下线！当前在线人数：{len(clients)}")
                 log_queue.put(f"[{get_current_time()}] {username} ({addr}) 已断开，当前在线：{len(clients)}")
                 refresh_event.set()   # 有用户离开，立即刷新在线用户列表
+                broadcast_user_list() # 通知所有客户端更新在线列表
 
 
 def start_server():
